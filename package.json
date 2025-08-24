@@ -1,8 +1,7 @@
 {
   "name": "stremio-tugamovies",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stremio add-on (TugaMovies by Ze) for osteusfilmestuga.online",
-  "type": "module",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +11,6 @@
   },
   "dependencies": {
     "cheerio": "^1.0.0",
-    "stremio-addon-sdk": "^1.6.11"
+    "stremio-addon-sdk": "^1.6.0"
   }
 }
