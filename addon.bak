@@ -1,0 +1,250 @@
+// addon.js
+// Stremio add-on for osteusfilmestuga.online (demo)
+// Requires: npm i stremio-addon-sdk cheerio
+// (No 'got' needed; uses global fetch in Node 18+)
+
+const { addonBuilder } = require('stremio-addon-sdk');
+const cheerio = require('cheerio');
+
+// ───────────────────────────────────────────────────────────
+// Site config
+// ───────────────────────────────────────────────────────────
+const SITE = 'https://osteusfilmestuga.online';
+const CATALOG_URL = `${SITE}/filmes/`;
+const HEADERS = {
+  'user-agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+  accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+};
+
+// ───────────────────────────────────────────────────────────
+// Manifest
+// ───────────────────────────────────────────────────────────
+const manifest = {
+  id: 'org.example.osteus',
+  version: '1.1.1',
+  name: 'Os Teus Filmes Tuga (demo)',
+  description:
+    'Catalog + streams from osteusfilmestuga.online (index only open-licence titles).',
+  catalogs: [
+    {
+      type: 'movie',
+      id: 'osteus-filmes',
+      name: 'Os Teus Filmes Tuga',
+      extra: [{ name: 'skip' }, { name: 'search' }]
+    }
+  ],
+  resources: ['catalog', 'stream', 'meta'],
+  types: ['movie'],
+  idPrefixes: ['osteus:']
+};
+
+const builder = new addonBuilder(manifest);
+
+// ───────────────────────────────────────────────────────────
+// Helpers
+// ───────────────────────────────────────────────────────────
+function toIdFromSlug(slug) {
+  return `osteus:${slug}`;
+}
+function fromIdToSlug(id) {
+  return id.replace(/^osteus:/, '');
+}
+function normalizeURL(href) {
+  try {
+    return new URL(href, SITE).toString();
+  } catch {
+    return '';
+  }
+}
+function isFilmPath(u) {
+  try {
+    return new URL(u).pathname.startsWith('/filmes/');
+  } catch {
+    return false;
+  }
+}
+
+// fetch HTML with timeout (15s)
+async function fetchHTML(url) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, {
+      headers: HEADERS,
+      redirect: 'follow',
+      signal: controller.signal
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} for ${url}`);
+    }
+    return await res.text();
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// ───────────────────────────────────────────────────────────
+// Catalog parser
+// ───────────────────────────────────────────────────────────
+async function parseCatalogPage(page = 1, query = '') {
+  let url = CATALOG_URL;
+
+  if (query && query.trim()) {
+    const qs = new URLSearchParams({ s: query.trim() }).toString();
+    url = `${SITE}/?${qs}`;
+  } else if (page > 1) {
+    url = `${CATALOG_URL}page/${page}/`;
+  }
+
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+
+  const metas = [];
+
+  // Grab anchors that point to /filmes/{slug}/ and try to collect title/poster
+  $('a[href]').each((_, a) => {
+    const href = normalizeURL($(a).attr('href'));
+    if (!isFilmPath(href)) return;
+
+    const { pathname } = new URL(href);
+    const slug = pathname.replace(/^\/filmes\//, '').replace(/\/+$/, '');
+    if (!slug) return;
+
+    const title =
+      $(a).attr('title') ||
+      $(a).find('img[alt]').attr('alt') ||
+      $(a).text().trim();
+
+    const poster =
+      $(a).find('img').attr('data-src') ||
+      $(a).find('img').attr('src') ||
+      (($(a).find('img').attr('srcset') || '').split(' ')[0] || '');
+
+    metas.push({
+      id: toIdFromSlug(slug),
+      type: 'movie',
+      name: title || slug.replace(/-/g, ' '),
+      poster: poster || undefined
+    });
+  });
+
+  // de-dup & prune
+  const seen = new Set();
+  const clean = metas.filter((m) => {
+    if (!m.name) return false;
+    if (seen.has(m.id)) return false;
+    seen.add(m.id);
+    return true;
+  });
+
+  return clean.slice(0, 60); // keep page size reasonable
+}
+
+// ───────────────────────────────────────────────────────────
+// Movie page parser (meta + streams)
+// ───────────────────────────────────────────────────────────
+async function parseMoviePage(slug) {
+  const url = `${SITE}/filmes/${slug}/`;
+  const html = await fetchHTML(url);
+  const $ = cheerio.load(html);
+
+  const name =
+    $('h1').first().text().trim() ||
+    $('meta[property="og:title"]').attr('content') ||
+    slug.replace(/-/g, ' ');
+
+  const poster =
+    $('meta[property="og:image"]').attr('content') ||
+    $('img.wp-post-image').attr('src') ||
+    undefined;
+
+  // Collect candidate players
+  const candidates = new Set();
+
+  // (1) iframes (src or data-src) present in static HTML
+  $('iframe').each((_, el) => {
+    const s = $(el).attr('src') || $(el).attr('data-src');
+    if (s) candidates.add(normalizeURL(s));
+  });
+
+  // (2) direct media links if any
+  $('a[href$=".mp4"], a[href$=".m3u8"]').each((_, el) => {
+    const s = $(el).attr('href');
+    if (s) candidates.add(normalizeURL(s));
+  });
+
+  // Streams: prefer direct media; else externalUrl
+  const streams = [];
+  for (const u of candidates) {
+    if (!u) continue;
+    if (/\.(mp4|m3u8)(\?|$)/i.test(u)) streams.push({ url: u, title: 'Source' });
+    else streams.push({ externalUrl: u, title: 'Open Player' });
+  }
+
+  // Fallback when embeds are injected via JS (no static players)
+  if (!streams.length) streams.push({ externalUrl: url, title: 'Watch on site' });
+
+  return {
+    meta: {
+      id: toIdFromSlug(slug),
+      type: 'movie',
+      name,
+      poster
+    },
+    streams
+  };
+}
+
+// ───────────────────────────────────────────────────────────
+// Handlers
+// ───────────────────────────────────────────────────────────
+builder.defineCatalogHandler(async ({ type, id, extra }) => {
+  try {
+    if (type !== 'movie' || id !== 'osteus-filmes') return { metas: [] };
+
+    const skipRaw = extra && (extra.skip ?? 0);
+    const skip = Number.isFinite(+skipRaw) ? parseInt(skipRaw, 10) : 0;
+    const page = Math.max(1, Math.floor(skip / 60) + 1);
+
+    const search = (extra && extra.search) || '';
+    const metas = await parseCatalogPage(page, search);
+
+    return { metas };
+  } catch (err) {
+    console.error('catalog error:', err && err.message);
+    return { metas: [] };
+  }
+});
+
+builder.defineMetaHandler(async ({ type, id }) => {
+  try {
+    if (type !== 'movie' || !id.startsWith('osteus:')) return { meta: {} };
+    const { meta } = await parseMoviePage(fromIdToSlug(id));
+    return { meta };
+  } catch (err) {
+    console.error('meta error:', err && err.message);
+    return { meta: {} };
+  }
+});
+
+builder.defineStreamHandler(async ({ type, id }) => {
+  try {
+    if (type !== 'movie' || !id.startsWith('osteus:')) return { streams: [] };
+    const { streams } = await parseMoviePage(fromIdToSlug(id));
+
+    // direct media first
+    const sorted = streams.sort((a, b) => {
+      const ad = a.url ? 0 : 1;
+      const bd = b.url ? 0 : 1;
+      return ad - bd;
+    });
+
+    return { streams: sorted };
+  } catch (err) {
+    console.error('stream error:', err && err.message);
+    return { streams: [] };
+  }
+});
+
+module.exports = builder.getInterface();

@@ -1,0 +1,19 @@
+{
+  "name": "stremio-my-addon",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10",
+    "playwright": "^1.55.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.1.2",
+    "p-limit": "^7.1.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
